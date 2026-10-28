@@ -1,0 +1,79 @@
+name: FocusTracker
+options:
+  bundleIdPrefix: com.chauanhcong
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+packages:
+  Yams:
+    url: https://github.com/jpsim/Yams
+    from: 5.3.1
+  # Issue #49: the platform-agnostic sync core — a LOCAL SwiftPM package
+  # (contract §2.7; Foundation only, XCTest-able without AppKit).
+  SyncCore:
+    path: Packages/SyncCore
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+targets:
+  FocusTracker:
+    type: application
+    platform: macOS
+    settings:
+      base:
+        PRODUCT_NAME: "Focus Tracker"
+        # Spaces are invalid in Swift module identifiers - keep the module
+        # "FocusTracker" so every @testable import (and the 753-test suite)
+        # survives the #48a display-name rename.
+        PRODUCT_MODULE_NAME: FocusTracker
+        # Issue #55: single source of truth for the release version
+        # (scripts/build-release.sh reads it back from the built plist).
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+    sources:
+      - Sources/FocusTracker
+    dependencies:
+      - package: Yams
+      - package: SyncCore
+      - sdk: AVFoundation.framework
+    info:
+      path: Sources/FocusTracker/Info.plist
+      properties:
+        CFBundleDisplayName: Focus Tracker
+        CFBundleName: Focus Tracker
+        LSMinimumSystemVersion: "14.0"
+        NSPrincipalClass: NSApplication
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSApplicationCategoryType: public.app-category.productivity
+  FocusTrackerTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/FocusTrackerTests
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        # The #48a product rename: XcodeGen derives TEST_HOST from the target
+        # NAME (FocusTracker.app) and ignores PRODUCT_NAME - override it so the
+        # test host is the renamed "Focus Tracker.app".
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Focus Tracker.app/Contents/MacOS/Focus Tracker"
+    dependencies:
+      - target: FocusTracker
+      - package: Yams
+      - package: SyncCore
+schemes:
+  FocusTracker:
+    build:
+      targets:
+        FocusTracker: all
+        FocusTrackerTests: [test]
+    test:
+      targets:
+        - FocusTrackerTests
+        # Issue #49: the SyncCoreTests target runs in THE ONE standard
+        # xcodebuild command alongside the 753+ suite (the groomed
+        # Testable-Target-Reference pin: `package: <name>/<target>`).
+        - package: SyncCore/SyncCoreTests

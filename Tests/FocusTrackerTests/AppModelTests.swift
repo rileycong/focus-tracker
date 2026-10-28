@@ -1,0 +1,533 @@
+import XCTest
+@testable import FocusTracker
+
+/// Tests for the #14 composition root (`AppModel`): fixture-vault loading
+/// and exposure, the pinned vault-path change policy (refused while a
+/// session is active), reloadVault external-change pickup, the degraded
+/// state with the path retained, and the #13 recovery surfacing.
+///
+/// `AppModel` is `@MainActor`, so the whole suite runs on the main actor;
+/// the async bootstrap is the issue-sanctioned explicit startup step and the
+/// persistence directory + scheduler + settings suite are injected seams
+/// (per #13/#14) so nothing here touches real Application Support or real
+/// user preferences.
+@MainActor
+final class AppModelTests: XCTestCase {
+
+    // MARK: - Test doubles (same seams as #13's coordinator tests)
+
+    private final class FakeClock: FocusSessionClock, @unchecked Sendable {
+        var monotonicSeconds: TimeInterval = 0
+        var wallClockNow = Date(timeIntervalSinceReferenceDate: 800_000_000)
+    }
+
+    /// Manual scheduler: records the last injected interval so tests can
+    /// assert re-arming; never fires anything by itself.
+    private final class ManualTickScheduler: ActiveSessionTickScheduler, @unchecked Sendable {
+        private let lock = NSLock()
+        private var interval: TimeInterval?
+
+        func schedule(after interval: TimeInterval, _ tick: @escaping @Sendable () -> Void) {
+            lock.withLock { self.interval = interval }
+        }
+
+        func cancel() {
+            lock.withLock { interval = nil }
+        }
+
+        var pendingInterval: TimeInterval? { lock.withLock { interval } }
+    }
+
+    // MARK: - Fixture access (the repo fixture is copied to a temp dir, never touched)
+
+    private static let fixturesVault = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // Tests/FocusTrackerTests
+        .deletingLastPathComponent() // Tests
+        .deletingLastPathComponent() // repo root
+        .appendingPathComponent("fixtures/sample-vault", isDirectory: true)
+
+    private var root: URL!
+    private var vaultURL: URL!
+    private var persistenceDirectory: URL!
+    private var suiteName: String!
+    private var settings: AppSettings!
+    private var scheduler: ManualTickScheduler!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("AppModelTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        vaultURL = root.appendingPathComponent("vault", isDirectory: true)
+        try FileManager.default.copyItem(at: Self.fixturesVault, to: vaultURL)
+        persistenceDirectory = root.appendingPathComponent("persistence", isDirectory: true)
+        suiteName = "AppModelTests-\(UUID().uuidString)"
+        settings = try AppSettings(suiteName: suiteName)
+        scheduler = ManualTickScheduler()
+    }
+
+    override func tearDownWithError() throws {
+        if let root {
+            try? FileManager.default.removeItem(at: root)
+        }
+        if let suiteName {
+            UserDefaults().removePersistentDomain(forName: suiteName)
+        }
+        try super.tearDownWithError()
+    }
+
+    // MARK: - Helpers
+
+    private struct TestFailure: Error {}
+
+    private func makeModel(clock: FakeClock = FakeClock()) -> AppModel {
+        AppModel(
+            settings: settings,
+            persistenceDirectory: persistenceDirectory,
+            scheduler: scheduler,
+            sessionClock: clock)
+    }
+
+    /// A model bootstrapped against the fixture vault (the configured-vault
+    /// startup path).
+    private func makeConfiguredModel(clock: FakeClock = FakeClock()) async -> AppModel {
+        settings.vaultPath = vaultURL.path(percentEncoded: false)
+        let model = makeModel(clock: clock)
+        await model.bootstrap()
+        return model
+    }
+
+    private func requireLoaded(
+        _ state: AppModel.VaultState, file: StaticString = #filePath, line: UInt = #line
+    ) throws -> VaultStore.Inventory {
+        guard case .loaded(let inventory) = state else {
+            XCTFail("expected .loaded(...), got \(state)", file: file, line: line)
+            throw TestFailure()
+        }
+        return inventory
+    }
+
+    /// Writes a minimal valid task file into the given vault's `Tasks/`.
+    private func writeTaskFile(_ title: String, id: UUID, in vault: URL) throws {
+        let text = """
+        ---
+        id: \(id.uuidString)
+        title: \(title)
+        status: To Do
+        categories:
+          - Testing
+        ---
+
+        Body of \(title).
+        """
+        try text.write(
+            to: vault.appendingPathComponent("Tasks", isDirectory: true)
+                .appendingPathComponent("\(title).md"),
+            atomically: true,
+            encoding: .utf8)
+    }
+
+    /// A second, minimal vault with exactly one task (the path-change target).
+    private func makeSecondVault(named name: String = "vault-b") throws -> URL {
+        let url = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: url.appendingPathComponent("Tasks", isDirectory: true),
+            withIntermediateDirectories: true)
+        try writeTaskFile("Beta task", id: UUID(), in: url)
+        return url
+    }
+
+    private func makeSnapshot(
+        sessionID: UUID = UUID(), isPaused: Bool = false
+    ) -> ActiveSessionSnapshot {
+        ActiveSessionSnapshot(
+            sessionID: sessionID,
+            taskID: UUID(),
+            duration: 1500,
+            startedAt: Date(timeIntervalSinceReferenceDate: 800_000_000),
+            accumulatedFocusedSeconds: 120,
+            accumulatedPausedSeconds: isPaused ? 60 : 0,
+            pauseCount: isPaused ? 1 : 0,
+            isPaused: isPaused,
+            segmentStartMonotonic: 42)
+    }
+
+    // MARK: - Composition: configured vault loads and exposes tasks
+
+    func testBootstrapWithConfiguredVaultLoadsAndExposesTasks() async throws {
+        let model = await makeConfiguredModel()
+
+        _ = try requireLoaded(model.vaultState)
+        XCTAssertEqual(
+            model.tasks.map(\.title),
+            ["Plan Q4 roadmap", "Read Deep Work", "Renew passport"],
+            "tasks come back in filename-sorted order")
+        XCTAssertEqual(model.vaultURL, vaultURL)
+
+        let store = try XCTUnwrap(model.vaultStore, "the store exists for a configured vault")
+        let storeURL = await store.vaultURL
+        XCTAssertEqual(storeURL, vaultURL)
+        let logs = try XCTUnwrap(model.dailyLogStore)
+        let logsURL = await logs.vaultURL
+        XCTAssertEqual(logsURL, vaultURL)
+
+        XCTAssertEqual(model.sessionState, .idle)
+        XCTAssertTrue(model.isSessionActive == false)
+        XCTAssertNil(model.pendingSessionRecovery)
+    }
+
+    func testBootstrapWithoutConfiguredPathStaysNotConfigured() async throws {
+        let model = makeModel()
+        await model.bootstrap()
+
+        guard case .notConfigured = model.vaultState else {
+            XCTFail("expected .notConfigured, got \(model.vaultState)")
+            return
+        }
+        XCTAssertTrue(model.tasks.isEmpty)
+        XCTAssertNil(model.vaultURL)
+        XCTAssertNil(model.vaultStore)
+        XCTAssertNil(model.dailyLogStore)
+        XCTAssertEqual(model.sessionState, .idle)
+        XCTAssertNil(model.pendingSessionRecovery)
+    }
+
+    // MARK: - Launch state at construction (issue #53: the launch-flash fix)
+
+    /// Issue #53 pin 8(a) — the first-frame contract, sync-OFF side: a
+    /// model constructed with a PERSISTED path is `.opening` BEFORE any
+    /// `bootstrap()` call (the pre-`.task` frames render the opening
+    /// placeholder, never onboarding), and `bootstrap()` resolves it to
+    /// `.loaded` with the vault's tasks. The fix is sync-agnostic — this
+    /// suite runs with the toggle off (the settings default).
+    func testConfiguredModelConstructsOpeningAndBootstrapResolvesLoaded() async throws {
+        settings.vaultPath = vaultURL.path(percentEncoded: false)
+        let model = makeModel()
+
+        guard case .opening = model.vaultState else {
+            XCTFail("expected .opening before bootstrap, got \(model.vaultState)")
+            return
+        }
+        XCTAssertTrue(model.tasks.isEmpty, "no tasks before the first load")
+
+        await model.bootstrap()
+
+        _ = try requireLoaded(model.vaultState)
+        XCTAssertEqual(
+            model.tasks.map(\.title),
+            ["Plan Q4 roadmap", "Read Deep Work", "Renew passport"])
+    }
+
+    /// Issue #53 pin 8(b) — the unconfigured contract with the pre-bootstrap
+    /// assert added: construction with NO persisted path is `.notConfigured`
+    /// (never `.opening`), and `bootstrap()` leaves it `.notConfigured` —
+    /// the #15/#26 onboarding flow keys off exactly this.
+    func testUnconfiguredModelIsNotConfiguredBeforeAndAfterBootstrap() async throws {
+        let model = makeModel()
+
+        guard case .notConfigured = model.vaultState else {
+            XCTFail("expected .notConfigured before bootstrap, got \(model.vaultState)")
+            return
+        }
+
+        await model.bootstrap()
+
+        guard case .notConfigured = model.vaultState else {
+            XCTFail("expected .notConfigured after bootstrap, got \(model.vaultState)")
+            return
+        }
+        XCTAssertTrue(model.tasks.isEmpty)
+    }
+
+    /// Issue #53 awkward case: the exit seam (`reloadVault()`) does NOT
+    /// depend on `bootstrap()` having run — a configured model reloaded
+    /// directly (the `testReloadVaultPicksUpExternalChanges` shape) goes
+    /// `.opening` → `.loaded`.
+    func testDirectReloadVaultResolvesOpeningWithoutBootstrap() async throws {
+        settings.vaultPath = vaultURL.path(percentEncoded: false)
+        let model = makeModel()
+
+        guard case .opening = model.vaultState else {
+            XCTFail("expected .opening before the direct reload, got \(model.vaultState)")
+            return
+        }
+
+        await model.reloadVault()
+
+        _ = try requireLoaded(model.vaultState)
+        XCTAssertEqual(model.tasks.count, 3)
+    }
+
+    /// Issue #53 awkward case: a DEGRADED relaunch (the vault directory
+    /// deleted while the app was not running) starts `.opening` and resolves
+    /// through the same `reloadVault()` path into `.vaultMissing` with the
+    /// path retained (the #14 binding, unchanged).
+    func testDegradedRelaunchOpensThenResolvesVaultMissingWithPathRetained() async throws {
+        try FileManager.default.removeItem(at: vaultURL)
+        settings.vaultPath = vaultURL.path(percentEncoded: false)
+        let model = makeModel()
+
+        guard case .opening = model.vaultState else {
+            XCTFail("expected .opening before bootstrap, got \(model.vaultState)")
+            return
+        }
+
+        await model.bootstrap()
+
+        guard case .vaultMissing(let path) = model.vaultState else {
+            XCTFail("expected .vaultMissing after bootstrap, got \(model.vaultState)")
+            return
+        }
+        XCTAssertEqual(path, vaultURL)
+        XCTAssertEqual(model.vaultURL, vaultURL, "the model retains the path")
+        XCTAssertEqual(
+            settings.vaultPath, vaultURL.path(percentEncoded: false),
+            "the stored path is never silently cleared")
+        XCTAssertTrue(model.tasks.isEmpty)
+    }
+
+    /// Issue #53 awkward case: the #26 onboarding flows (create/select from
+    /// unconfigured) NEVER see `.opening` — an unconfigured model starts
+    /// `.notConfigured` and `setVaultPath(to:)` (the `applyVaultLocation`
+    /// tail) writes `.loaded` directly, exactly as before #53.
+    func testVaultSelectionFromUnconfiguredGoesNotConfiguredStraightToLoaded() async throws {
+        let model = makeModel()
+
+        guard case .notConfigured = model.vaultState else {
+            XCTFail("expected .notConfigured at construction, got \(model.vaultState)")
+            return
+        }
+        await model.bootstrap()
+
+        let vaultB = try makeSecondVault()
+        let outcome = await model.setVaultPath(to: vaultB)
+
+        XCTAssertEqual(outcome, .changed)
+        _ = try requireLoaded(model.vaultState)
+        XCTAssertEqual(model.tasks.map(\.title), ["Beta task"])
+    }
+
+    // MARK: - Vault path change: accepted path
+
+    func testSetVaultPathFromNotConfiguredChangesStoresAndReloads() async throws {
+        let model = makeModel()
+        await model.bootstrap()
+        let vaultB = try makeSecondVault()
+
+        let outcome = await model.setVaultPath(to: vaultB)
+
+        XCTAssertEqual(outcome, .changed)
+        XCTAssertEqual(model.vaultURL, vaultB)
+        _ = try requireLoaded(model.vaultState)
+        XCTAssertEqual(model.tasks.map(\.title), ["Beta task"])
+        XCTAssertEqual(
+            settings.vaultPath, vaultB.path(percentEncoded: false),
+            "the chosen path persists to settings")
+        let store = try XCTUnwrap(model.vaultStore)
+        let storeURL = await store.vaultURL
+        XCTAssertEqual(storeURL, vaultB)
+        let logs = try XCTUnwrap(model.dailyLogStore)
+        let logsURL = await logs.vaultURL
+        XCTAssertEqual(logsURL, vaultB)
+    }
+
+    // MARK: - Vault path change: pinned refusal policy
+
+    func testPathChangeWhileSessionActiveIsRefusedAndStoresUnchanged() async throws {
+        let model = await makeConfiguredModel()
+        let vaultB = try makeSecondVault()
+        // The fixture's first task is In Progress: the #19 start flow's
+        // allowed no-op path — exactly what an "active session" needs.
+        let taskID = try XCTUnwrap(model.tasks.first?.id)
+        _ = try await model.startSession(taskID: taskID)
+        XCTAssertEqual(model.sessionState, .running)
+
+        let outcome = await model.setVaultPath(to: vaultB)
+
+        XCTAssertEqual(outcome, .refusedWhileSessionActive, "the typed refusal outcome")
+        // Stores, settings and state are all untouched.
+        XCTAssertEqual(model.vaultURL, vaultURL)
+        _ = try requireLoaded(model.vaultState)
+        XCTAssertEqual(
+            model.tasks.map(\.title),
+            ["Plan Q4 roadmap", "Read Deep Work", "Renew passport"])
+        let store = try XCTUnwrap(model.vaultStore)
+        let storeURL = await store.vaultURL
+        XCTAssertEqual(storeURL, vaultURL)
+        XCTAssertEqual(settings.vaultPath, vaultURL.path(percentEncoded: false))
+        XCTAssertEqual(model.sessionState, .running)
+        XCTAssertTrue(model.isSessionActive)
+
+        // The refusal is temporary: after the end flow completes (the
+        // required #22 modal submitted, ending state cleared) the change
+        // goes through.
+        _ = try model.endSession()
+        var form = EndOfSessionFormState()
+        form.completedChoice = .no
+        form.focusRating = 3
+        form.energyRating = 3
+        let submission = try await model.submitEndOfSession(form)
+        XCTAssertEqual(submission, .success)
+        let lateOutcome = await model.setVaultPath(to: vaultB)
+        XCTAssertEqual(lateOutcome, .changed)
+        XCTAssertEqual(model.tasks.map(\.title), ["Beta task"])
+    }
+
+    // MARK: - reloadVault picks up external changes
+
+    func testReloadVaultPicksUpExternalChanges() async throws {
+        let model = await makeConfiguredModel()
+        XCTAssertEqual(model.tasks.count, 3)
+
+        try writeTaskFile("Zebra task", id: UUID(), in: vaultURL)
+
+        await model.reloadVault()
+
+        _ = try requireLoaded(model.vaultState)
+        XCTAssertEqual(model.tasks.count, 4)
+        XCTAssertTrue(model.tasks.contains { $0.title == "Zebra task" })
+    }
+
+    // MARK: - Degraded state with path retained (binding criterion)
+
+    func testVaultDirectoryDeletedAfterConfigYieldsDegradedStateWithPathRetained() async throws {
+        let model = await makeConfiguredModel()
+        _ = try requireLoaded(model.vaultState)
+
+        try FileManager.default.removeItem(at: vaultURL)
+        await model.reloadVault()
+
+        guard case .vaultMissing(let path) = model.vaultState else {
+            XCTFail("expected .vaultMissing, got \(model.vaultState)")
+            return
+        }
+        XCTAssertEqual(path, vaultURL)
+        XCTAssertEqual(model.vaultURL, vaultURL, "the model retains the path")
+        XCTAssertTrue(model.tasks.isEmpty)
+        XCTAssertEqual(
+            settings.vaultPath, vaultURL.path(percentEncoded: false),
+            "the stored path is never silently cleared")
+
+        // Re-selection is offered and works from the degraded state.
+        try FileManager.default.createDirectory(
+            at: vaultURL.appendingPathComponent("Tasks", isDirectory: true),
+            withIntermediateDirectories: true)
+        let reselection = await model.setVaultPath(to: vaultURL)
+        XCTAssertEqual(reselection, .changed)
+        _ = try requireLoaded(model.vaultState)
+        XCTAssertTrue(model.tasks.isEmpty, "empty-but-valid vault after re-selection")
+    }
+
+    func testTasksDirectoryDeletedYieldsTasksDirectoryMissingStateWithPathRetained() async throws {
+        let model = await makeConfiguredModel()
+
+        try FileManager.default.removeItem(
+            at: vaultURL.appendingPathComponent("Tasks", isDirectory: true))
+        await model.reloadVault()
+
+        guard case .tasksDirectoryMissing(let path) = model.vaultState else {
+            XCTFail("expected .tasksDirectoryMissing, got \(model.vaultState)")
+            return
+        }
+        XCTAssertEqual(path, vaultURL)
+        XCTAssertEqual(model.vaultURL, vaultURL)
+        XCTAssertTrue(model.tasks.isEmpty)
+        XCTAssertEqual(settings.vaultPath, vaultURL.path(percentEncoded: false))
+    }
+
+    // MARK: - Recovery surfacing (#13 → #20/#22 hand-off)
+
+    func testSnapshotOnDiskSurfacesPendingResumeOrEndAfterBootstrap() async throws {
+        let snapshot = makeSnapshot()
+        try FileActiveSessionPersistence(directory: persistenceDirectory).save(snapshot)
+
+        let model = await makeConfiguredModel()
+
+        let pending = try XCTUnwrap(
+            model.pendingSessionRecovery, "a stored snapshot surfaces the pending state")
+        XCTAssertEqual(pending, snapshot)
+        XCTAssertEqual(model.sessionState, .idle, "nothing is restored before the user chooses")
+        XCTAssertFalse(model.isSessionActive)
+    }
+
+    func testRestoreConsumesPendingSnapshotAndRehydratesSession() async throws {
+        let snapshot = makeSnapshot(isPaused: true)
+        try FileActiveSessionPersistence(directory: persistenceDirectory).save(snapshot)
+        let model = await makeConfiguredModel()
+        XCTAssertNotNil(model.pendingSessionRecovery)
+
+        let outcome = try model.restorePendingSession()
+
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertNil(model.pendingSessionRecovery, "restore consumes the pending state")
+        XCTAssertTrue(model.isSessionActive)
+        XCTAssertEqual(model.sessionState, .paused, "the snapshot's phase is carried over")
+        XCTAssertEqual(
+            scheduler.pendingInterval, AppModel.autosaveIntervalSeconds,
+            "the autosave chain re-arms after restore")
+        XCTAssertEqual(
+            model.focusedSeconds, 120, accuracy: 1e-9,
+            "timing continues from the snapshot's accumulators")
+    }
+
+    func testDiscardClearsPendingSnapshotInMemoryAndOnDisk() async throws {
+        try FileActiveSessionPersistence(directory: persistenceDirectory).save(makeSnapshot())
+        let model = await makeConfiguredModel()
+        XCTAssertNotNil(model.pendingSessionRecovery)
+
+        XCTAssertEqual(model.discardPendingSession(), .discarded)
+        XCTAssertNil(model.pendingSessionRecovery)
+        XCTAssertFalse(model.isSessionActive)
+        XCTAssertEqual(model.sessionState, .idle)
+
+        // The on-disk snapshot is cleared too: a fresh model over the same
+        // persistence directory surfaces nothing.
+        let fresh = makeModel()
+        await fresh.bootstrap()
+        XCTAssertNil(fresh.pendingSessionRecovery)
+    }
+
+    func testIdleStartWithNoSnapshotHasNoPendingState() async throws {
+        let model = await makeConfiguredModel()
+
+        XCTAssertNil(model.pendingSessionRecovery)
+        XCTAssertEqual(model.sessionState, .idle)
+        XCTAssertFalse(model.isSessionActive)
+    }
+
+    func testRestoreAndDiscardWithoutPendingStateAreTypedNoOps() async throws {
+        let model = await makeConfiguredModel()
+
+        XCTAssertEqual(try model.restorePendingSession(), .noPendingSession)
+        XCTAssertEqual(model.discardPendingSession(), .noPendingSession)
+        XCTAssertFalse(model.isSessionActive)
+    }
+
+    // MARK: - Session state passthroughs
+
+    func testSessionPassthroughsTrackIdleRunningPausedIdle() async throws {
+        let model = await makeConfiguredModel()
+        // The fixture's first task is In Progress: the #19 start flow's
+        // allowed no-op path.
+        let taskID = try XCTUnwrap(model.tasks.first?.id)
+
+        let outcome = try await model.startSession(taskID: taskID)
+        guard case .started = outcome else {
+            XCTFail("expected .started, got \(outcome)")
+            return
+        }
+        XCTAssertEqual(model.sessionState, .running)
+        XCTAssertTrue(model.isSessionActive)
+
+        try model.pauseSession()
+        XCTAssertEqual(model.sessionState, .paused)
+
+        try model.resumeSession()
+        XCTAssertEqual(model.sessionState, .running)
+
+        let result = try model.endSession()
+        XCTAssertEqual(result.taskID, taskID)
+        XCTAssertEqual(model.sessionState, .idle)
+        XCTAssertFalse(model.isSessionActive)
+    }
+}
