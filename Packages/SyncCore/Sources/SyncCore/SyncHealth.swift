@@ -31,6 +31,7 @@ public enum SyncHealthEvaluator {
     /// views compare health by VALUE against this constant — never against
     /// a duplicated literal. The text itself is unchanged from #49.
     public static let noRemoteReason = "no sync remote is configured"
+    public static let toolsUnavailableReason = "Backup to GitHub needs Apple's free Command Line Tools (or Xcode). Everything else works without them."
 
     /// Returns nil when all static preconditions hold, otherwise the pinned
     /// reason clause. Check order follows the [Health] pin: the git binary →
@@ -38,10 +39,12 @@ public enum SyncHealthEvaluator {
     /// remote resolved. Every reason reads as a clause of the Settings row's
     /// wording function (tests assert these EXACT strings).
     public static func staticFailureReason(
-        vaultPath: String?, remoteURL: String?, gitBinary: String
+        vaultPath: String?, remoteURL: String?, gitBinary: String,
+        resolver: GitToolResolver = GitToolResolver()
     ) -> String? {
-        guard FileManager.default.isExecutableFile(atPath: gitBinary) else {
-            return "the git binary was not found at \(gitBinary)"
+        guard case .available = resolver.resolve(gitBinary: gitBinary) else {
+            return resolver.usesDefaultPolicy(gitBinary: gitBinary)
+                ? toolsUnavailableReason : "the git binary was not found at \(gitBinary)"
         }
         guard let vaultPath,
             !vaultPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

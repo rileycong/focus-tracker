@@ -381,6 +381,61 @@ final class AppModelSyncTests: XCTestCase {
 
     // MARK: - Model plumbing
 
+    func testMissingToolsPolicySurvivesAllModelEntriesAndVaultSwitch() async throws {
+        let fixture = try await SyncModelFixture.make()
+        let second = try await SyncModelFixture.make()
+        defer {
+            try? FileManager.default.removeItem(at: fixture.rootURL)
+            try? FileManager.default.removeItem(at: second.rootURL)
+        }
+        let domain = "ft58-model-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer { defaults.removePersistentDomain(forName: domain) }
+        var settings = AppSettings(defaults: defaults)
+        settings.vaultPath = fixture.vaultURL.path
+        settings.vaultSyncEnabled = true
+        settings.vaultSyncRemote = fixture.remoteURLString
+        let runner = CountingStubRunner()
+        let missing = GitToolResolver(environment: { ["DEVELOPER_DIR": "/missing-selected-tools"] })
+        let model = AppModel(settings: settings, persistenceDirectory: fixture.persistenceDirectory,
+            syncDebounceInterval: 0.01, syncPullInterval: 0.01,
+            syncGitRunner: runner, syncGitToolResolver: missing)
+        let unavailable = SyncHealth.unavailable(reason: SyncHealthEvaluator.toolsUnavailableReason)
+        await model.bootstrap()
+        await model.syncSettingsSheetAppeared()
+        XCTAssertEqual(model.syncHealth, unavailable)
+        XCTAssertFalse(model.tasks.isEmpty) // ordinary offline load still works
+        await model.importInboxDrafts()
+        model.noteVaultWrite()
+        model.flushSyncForTermination()
+        let clear = await model.setSyncRemote(" \n")
+        XCTAssertEqual(clear, .cleared)
+        XCTAssertEqual(model.syncHealth, unavailable) // tools precedes no remote
+        let saved = await model.setSyncRemote("https://github.com/example/vault")
+        XCTAssertEqual(saved, .saved("git@github.com:example/vault.git"))
+        await model.setSyncEnabled(false)
+        XCTAssertEqual(model.syncHealth, .disabled)
+        for _ in 0..<10 {
+            await Task.yield()
+            XCTAssertEqual(model.syncHealth, .disabled) // drain queued pre-disable reports
+        }
+        await model.setSyncEnabled(true)
+        await model.syncSettingsSheetAppeared()
+        XCTAssertEqual(model.syncHealth, unavailable)
+        let switched = await model.setVaultPath(to: second.vaultURL)
+        XCTAssertEqual(switched, .changed)
+        let pull = await model.pullVaultOnce()
+        XCTAssertEqual(pull, .unavailable(SyncHealthEvaluator.toolsUnavailableReason))
+        try await Task.sleep(nanoseconds: 80_000_000)
+        await model.syncSettingsSheetAppeared()
+        XCTAssertEqual(model.syncHealth, unavailable)
+        XCTAssertEqual(runner.invocationCount, 0)
+        XCTAssertEqual(AppModel.syncHealthLine(for: unavailable), "Sync unavailable — Backup to GitHub needs Apple's free Command Line Tools (or Xcode). Everything else works without them.")
+        XCTAssertTrue(AppModel.isSyncToggleControlDisabled(for: unavailable))
+        XCTAssertFalse(AppModel.isSyncToggleControlDisabled(for: .unavailable(reason: SyncHealthEvaluator.noRemoteReason)))
+        await model.setSyncEnabled(false)
+    }
+
     private func makeModel(
         fixture: SyncModelFixture,
         syncEnabled: Bool,

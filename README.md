@@ -1,5 +1,9 @@
 # Focus Tracker
 
+**[Download for Mac](https://github.com/rileycong/focus-tracker/releases/latest/download/FocusTracker.dmg)**
+
+The green Code button and the Source code downloads are for programmers; to use the app, choose Download for Mac above.
+
 A small, native Mac app for keeping a task list and timing your focus
 sessions. Your tasks and session history live as plain Markdown files in a
 folder you choose — which can be an [Obsidian](https://obsidian.md) vault — so
@@ -13,30 +17,40 @@ macOS 14 (Sonoma) or later, on an Apple Silicon or Intel Mac (a universal app).
 
 ## Download and first launch
 
-Focus Tracker is free and open source. It is **not** signed with a paid Apple
-Developer certificate and is not notarized, so macOS asks you to approve it once.
+Focus Tracker is free and open source, ad-hoc signed (not a paid Developer ID
+certificate), and not notarized. Approval is needed on first launch and may be
+needed again after an update.
 
-1. Download `FocusTracker-v<version>.dmg` from the
-   [Releases](../../releases) page.
-2. Double-click the downloaded file, then drag **Focus Tracker** onto the
-   **Applications** shortcut in the window that appears.
-3. Eject the disk image (the eject button next to it in the Finder sidebar).
-4. Open **Focus Tracker** from your Applications folder. macOS will say it
-   cannot verify the app. Approve it once:
-   - **macOS 14:** right-click (or Control-click) the app, choose **Open**,
-     then click **Open** in the dialog.
-   - **macOS 15 or later (including macOS 26):** click **Done** (or **OK**) on
-     the warning. Open **System Settings → Privacy & Security**, scroll down to
-     the message that "Focus Tracker was blocked", click **Open Anyway**,
-     confirm with your password or Touch ID, then click **Open**. (Right-click →
-     Open no longer works on these versions.)
-   - **Terminal alternative (any version):**
+1. Download via **Download for Mac** above.
+2. Double-click `FocusTracker.dmg`.
+3. Drag **Focus Tracker** to **Applications** in the image.
+4. Eject the image using Finder's sidebar eject button.
+5. Open **Focus Tracker** from Applications.
 
-     ```sh
-     xattr -dr com.apple.quarantine "/Applications/Focus Tracker.app"
-     ```
+### macOS 14 (Sonoma)
 
-You only do this once. After that the app opens normally.
+1. If macOS blocks the app, close the warning.
+2. Control-click (or right-click) Focus Tracker in Applications.
+3. Choose Open.
+4. Click Open in the confirmation.
+5. If Open is not offered, use the System Settings steps below.
+
+### macOS 15 (Sequoia) or later, including macOS 26
+
+1. Close the warning with Done (or OK, if shown).
+2. Open System Settings.
+3. Click Privacy & Security.
+4. Scroll to Security.
+5. Click Open Anyway beside the message about Focus Tracker.
+6. Authenticate with your password or Touch ID if asked.
+7. Click Open in the confirmation.
+
+Warning text can vary by macOS version and language. Only approve the app if you
+trust its source. If Open Anyway is missing, try opening the app once more and
+return here; a managed Mac may require your administrator's help.
+See [Apple's guidance](https://support.apple.com/en-us/102445).
+A damaged-app or malware warning is a reason to stop, not bypass security.
+These directions are documentation, not a claim that every OS flow was tested.
 
 ## First run
 
@@ -143,21 +157,24 @@ AeroSpace, its command-line tool (see [DEVELOPMENT.md](DEVELOPMENT.md)).
 
 ## Optional: back up your vault to GitHub
 
+Optional GitHub backup needs Apple's free Command Line Tools (or Xcode); tasks and timers work without them.
+
 Sync is **off by default**; with it off Focus Tracker never runs `git`. Turn it
 on in **Vault → Sync Vault…**. You need a vault that is **already a git
 repository** (the app never runs `git init`), a GitHub repository of your own
-(there is **no default repository**; the link field starts empty), `git`
-installed (`xcode-select --install`) with `user.name` and `user.email` set, and
+(there is **no default repository**; the link field starts empty), git tools
+with `user.name` and `user.email` set, and
 **working SSH access to GitHub**. Paste an `https://github.com/<owner>/<repo>`
 or `git@github.com:<owner>/<repo>.git` link; the SSH form is always used (HTTPS
 tokens and credential helpers do not apply; GitHub only).
 
-Until a link is entered, switching sync on only shows "Sync unavailable — no
+When the other backup requirements are met, until a link is entered, switching
+sync on only shows "Sync unavailable — no
 sync remote is configured." and runs no `git` command. With a link, it sets or
 replaces your vault's `origin`; no token, no `gh`, no stored credentials. It
 stages only `Tasks/` and `Logs/`, commits "FocusTracker vault sync", pushes about
 a minute after a change and on quit, and pulls (fast-forward only) at launch and
-every 15 minutes. Problems never interrupt you; the sheet shows a status line.
+before an Inbox import and every 15 minutes. Problems never interrupt you; the sheet shows a status line.
 
 ## Questions and troubleshooting
 

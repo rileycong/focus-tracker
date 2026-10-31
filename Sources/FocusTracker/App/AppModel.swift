@@ -907,6 +907,7 @@ public final class AppModel {
     /// counting runner asserts zero spawns with the toggle off). Production:
     /// nil → the coordinator builds the real `ProcessGitRunner`.
     private let syncGitRunner: (any SyncCore.GitRunner)?
+    private let syncGitToolResolver: GitToolResolver
 
     // MARK: - Inbox draft import (issue #50, FocusVault FT-2)
 
@@ -982,7 +983,8 @@ public final class AppModel {
         syncDebounceInterval: TimeInterval = 60,
         syncPullInterval: TimeInterval = 900,
         syncTerminationFlushTimeout: TimeInterval = AppModel.terminationFlushTimeoutSeconds,
-        syncGitRunner: (any SyncCore.GitRunner)? = nil
+        syncGitRunner: (any SyncCore.GitRunner)? = nil,
+        syncGitToolResolver: GitToolResolver = GitToolResolver()
     ) {
         self.settings = settings
         let persistence = FileActiveSessionPersistence(directory: persistenceDirectory)
@@ -1013,6 +1015,7 @@ public final class AppModel {
         self.syncPullInterval = syncPullInterval
         self.syncTerminationFlushTimeout = syncTerminationFlushTimeout
         self.syncGitRunner = syncGitRunner
+        self.syncGitToolResolver = syncGitToolResolver
         // Wired after full initialization (the closures capture self):
         // the shake flag rides the alarm's state changes, and the focus-back
         // signal runs the #33 auto-end (the controller already stopped the
@@ -1329,6 +1332,7 @@ public final class AppModel {
                 debounceIntervalSeconds: debounceInterval,
                 pullIntervalSeconds: pullInterval),
             runner: runner,
+            resolver: syncGitToolResolver,
             onHealthChange: { [weak self] reporter, health in
                 Task { await self?.mirrorSyncHealth(from: reporter, health) }
             },
@@ -1638,6 +1642,9 @@ public final class AppModel {
         case .disabled:
             return "Sync is off."
         case .unavailable(let reason):
+            if reason == SyncHealthEvaluator.toolsUnavailableReason {
+                return "Sync unavailable — " + reason
+            }
             return "Sync unavailable — \(reason)."
         case .idle:
             return "Sync is on and healthy."
@@ -1652,6 +1659,11 @@ public final class AppModel {
     /// reports are identity-guarded away.
     private func mirrorSyncHealth(from reporter: SyncCoordinator, _ health: SyncHealth) {
         guard reporter === syncCoordinator else { return }
+        // A queued report from before disable must not overwrite the off state.
+        guard settings.vaultSyncEnabled else {
+            syncHealth = .disabled
+            return
+        }
         syncHealth = health
     }
 
@@ -1683,7 +1695,7 @@ public final class AppModel {
         let failure = SyncHealthEvaluator.staticFailureReason(
             vaultPath: settings.vaultPath,
             remoteURL: settings.resolvedVaultSyncRemote(),
-            gitBinary: ProcessGitRunner.defaultGitBinary)
+            gitBinary: ProcessGitRunner.defaultGitBinary, resolver: syncGitToolResolver)
         switch syncHealth {
         case .disabled, .unavailable, .idle:
             if let failure {

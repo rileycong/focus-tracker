@@ -77,6 +77,7 @@ public actor SyncCoordinator {
 
     public let configuration: Configuration
     private let runner: any GitRunner
+    private let resolver: GitToolResolver
 
     /// The last reported health; also handed to `onHealthChange`. Starts
     /// `.disabled` (a launch starts honest until the first attempt/apply).
@@ -136,14 +137,17 @@ public actor SyncCoordinator {
     public init(
         configuration: Configuration,
         runner: (any GitRunner)? = nil,
+        resolver: GitToolResolver = GitToolResolver(),
         onHealthChange: (@Sendable (SyncCoordinator, SyncHealth) -> Void)? = nil,
         onFastForwarded: (@Sendable (SyncCoordinator) -> Void)? = nil
     ) {
         self.configuration = configuration
+        self.resolver = resolver
         self.runner = runner ?? ProcessGitRunner(
             gitBinary: configuration.gitBinary,
             extraArguments: configuration.extraArguments,
-            timeoutSeconds: configuration.watchdogTimeoutSeconds)
+            timeoutSeconds: configuration.watchdogTimeoutSeconds,
+            resolver: resolver)
         self.remoteURL = configuration.remoteURL
         self.onHealthChange = onHealthChange
         self.onFastForwarded = onFastForwarded
@@ -260,7 +264,7 @@ public actor SyncCoordinator {
         if let reason = SyncHealthEvaluator.staticFailureReason(
             vaultPath: configuration.vaultURL.path,
             remoteURL: remoteURL,
-            gitBinary: configuration.gitBinary)
+            gitBinary: configuration.gitBinary, resolver: resolver)
         {
             reportHealth(.unavailable(reason: reason))
             return
@@ -270,6 +274,8 @@ public actor SyncCoordinator {
         let arguments = ["-C", configuration.vaultURL.path, "ls-remote", remoteURL]
         do {
             _ = try await runner.run(arguments: arguments)
+        } catch GitRunnerError.toolsUnavailable {
+            reportHealth(.unavailable(reason: SyncHealthEvaluator.toolsUnavailableReason))
         } catch {
             reportHealth(.error("the remote was not reachable — \(spawnTail(error))"))
         }
@@ -332,6 +338,7 @@ public actor SyncCoordinator {
     // MARK: - The cycle
 
     private func performCycle(kind: SyncCycleKind) async -> SyncPullOutcome {
+        guard isEnabled else { return .disabled }
         // Static preconditions FIRST — a FileManager probe, never a spawn:
         // while unavailable the engine stays silent ("sync stays off" +
         // reason), and VS-2's later `git init` inside the vault heals the
@@ -339,7 +346,7 @@ public actor SyncCoordinator {
         if let reason = SyncHealthEvaluator.staticFailureReason(
             vaultPath: configuration.vaultURL.path,
             remoteURL: remoteURL,
-            gitBinary: configuration.gitBinary)
+            gitBinary: configuration.gitBinary, resolver: resolver)
         {
             reportHealth(.unavailable(reason: reason))
             return .unavailable(reason)
@@ -379,9 +386,9 @@ public actor SyncCoordinator {
                 }
                 // `-u origin <branch>` when the branch has no upstream —
                 // the unborn-HEAD first push also creates the remote branch.
-                let upstreamOutcome = try? await runUnchecked(
+                let upstreamOutcome = try await runUnchecked(
                     ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-                if let upstreamOutcome, upstreamOutcome.exitStatus == 0 {
+                if upstreamOutcome.exitStatus == 0 {
                     try await runChecked(.push, ["push"])
                 } else {
                     try await runChecked(
@@ -395,6 +402,9 @@ public actor SyncCoordinator {
             }
             reportHealth(.idle)
             return fastForwarded ? .fastForwarded : .upToDate
+        } catch GitRunnerError.toolsUnavailable {
+            reportHealth(.unavailable(reason: SyncHealthEvaluator.toolsUnavailableReason))
+            return .unavailable(SyncHealthEvaluator.toolsUnavailableReason)
         } catch let error as SyncCycleError {
             reportHealth(.error(error.displayReason))
             return .failed(error)
@@ -491,6 +501,8 @@ public actor SyncCoordinator {
         do {
             return try await runner.run(
                 arguments: ["-C", configuration.vaultURL.path] + arguments)
+        } catch GitRunnerError.toolsUnavailable {
+            throw GitRunnerError.toolsUnavailable
         } catch {
             throw SyncCycleError(
                 step: .fetch, detail: spawnTail(error))
@@ -533,7 +545,7 @@ public actor SyncCoordinator {
         if let reason = SyncHealthEvaluator.staticFailureReason(
             vaultPath: configuration.vaultURL.path,
             remoteURL: remoteURL,
-            gitBinary: configuration.gitBinary)
+            gitBinary: configuration.gitBinary, resolver: resolver)
         {
             return .unavailable(reason: reason)
         }
@@ -541,7 +553,8 @@ public actor SyncCoordinator {
     }
 
     private func reportHealth(_ newHealth: SyncHealth) {
-        health = newHealth
-        onHealthChange?(self, newHealth)
+        let effective: SyncHealth = isEnabled ? newHealth : .disabled
+        health = effective
+        onHealthChange?(self, effective)
     }
 }

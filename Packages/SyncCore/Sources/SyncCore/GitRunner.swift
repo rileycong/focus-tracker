@@ -31,6 +31,7 @@ public protocol GitRunner: Sendable {
 }
 
 public enum GitRunnerError: Error, Equatable, Sendable {
+    case toolsUnavailable
     case spawnFailed(String)
 }
 
@@ -73,15 +74,21 @@ public final class ProcessGitRunner: GitRunner, Sendable {
     private let gitBinary: String
     private let extraArguments: [String]
     private let timeoutSeconds: TimeInterval
+    private let resolver: GitToolResolver
+    private let willLaunch: @Sendable (Process) -> Void
 
     public init(
         gitBinary: String = ProcessGitRunner.defaultGitBinary,
         extraArguments: [String] = [],
-        timeoutSeconds: TimeInterval = ProcessGitRunner.defaultTimeoutSeconds
+        timeoutSeconds: TimeInterval = ProcessGitRunner.defaultTimeoutSeconds,
+        resolver: GitToolResolver = GitToolResolver(),
+        willLaunch: @escaping @Sendable (Process) -> Void = { _ in }
     ) {
         self.gitBinary = gitBinary
         self.extraArguments = extraArguments
         self.timeoutSeconds = timeoutSeconds
+        self.resolver = resolver
+        self.willLaunch = willLaunch
     }
 
     /// The bounded collection of the (already-drained) pipe readers.
@@ -93,8 +100,14 @@ public final class ProcessGitRunner: GitRunner, Sendable {
     }
 
     public func run(arguments: [String]) async throws -> GitOutcome {
+        guard case .available(let path) = resolver.resolve(gitBinary: gitBinary) else {
+            if resolver.usesDefaultPolicy(gitBinary: gitBinary) {
+                throw GitRunnerError.toolsUnavailable
+            }
+            throw GitRunnerError.spawnFailed("the git binary was not found at \(gitBinary)")
+        }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: gitBinary)
+        process.executableURL = URL(fileURLWithPath: path)
         // The hermetic `-c` overrides ride FIRST (tests only); production
         // passes none. `environment` stays nil → the process environment
         // inherited (the [Credentials] criterion).
@@ -107,6 +120,7 @@ public final class ProcessGitRunner: GitRunner, Sendable {
         process.standardError = stderrPipe
 
         do {
+            willLaunch(process)
             try process.run()
         } catch {
             throw GitRunnerError.spawnFailed(String(describing: error))
